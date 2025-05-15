@@ -72,7 +72,7 @@ class DQNAgent(Node):
 
         self.stage = int(stage_num)
         self.train_mode = True
-        self.state_size = 26
+        self.state_size = 24 + 4  # Scan data (24) + goal (2: dist, angle) + obstacle (2: dist, angle) = 28
         self.action_size = 5
         self.max_training_episodes = int(max_training_episodes)
 

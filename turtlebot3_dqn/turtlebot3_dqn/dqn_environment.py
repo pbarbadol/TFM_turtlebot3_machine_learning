@@ -56,6 +56,10 @@ class RLEnvironment(Node):
         self.init_goal_distance = 0.5
         self.scan_ranges = []
         self.min_obstacle_distance = 10.0
+        self.min_obstacle_angle = 0.0     # NUEVO
+        self.robot_roll = 0.0             # NUEVO
+        self.robot_pitch = 0.0            # NUEVO
+        self.max_roll_pitch = 0.8         # NUEVO: umbral de 45 grados para vuelco
 
         self.local_step = 0
         self.stop_cmd_vel_timer = None
@@ -165,23 +169,45 @@ class RLEnvironment(Node):
             self.get_logger().error('task failed service call failed')
 
     def scan_sub_callback(self, scan):
-        self.scan_ranges = []
-        num_of_lidar_rays = len(scan.ranges)
+        # Temporalmente almacena los 360 rangos procesados
+        processed_scan_ranges_full = []
+        num_of_lidar_rays = len(scan.ranges) # Debería ser 360 para TurtleBot3
 
         for i in range(num_of_lidar_rays):
             if scan.ranges[i] == float('Inf'):
-                self.scan_ranges.append(3.5)
+                processed_scan_ranges_full.append(3.5)
             elif numpy.isnan(scan.ranges[i]):
-                self.scan_ranges.append(0)
+                processed_scan_ranges_full.append(0.0)
             else:
-                self.scan_ranges.append(scan.ranges[i])
+                processed_scan_ranges_full.append(scan.ranges[i])
 
-        self.min_obstacle_distance = min(self.scan_ranges)
+        # Reducir a 24 muestras (self.scan_ranges ahora tendrá 24 elementos)
+        self.scan_ranges = [] # Asegúrate de que esté vacío antes de llenarlo
+        if num_of_lidar_rays == 360:
+            samples_per_group = 15 # 360 / 24 = 15
+            for i in range(0, num_of_lidar_rays, samples_per_group):
+                self.scan_ranges.append(min(processed_scan_ranges_full[i:i + samples_per_group]))
+        else:
+            self.get_logger().warn(
+                f"Expected 360 laser scan ranges, but got {num_of_lidar_rays}. Filling scan_ranges with 24 zeros."
+            )
+            self.scan_ranges = [0.0] * 24
+
+        # Calcular min_obstacle_distance y min_obstacle_angle a partir de las 24 muestras
+        if self.scan_ranges:
+            self.min_obstacle_distance = min(self.scan_ranges)
+            min_obstacle_index = numpy.argmin(self.scan_ranges)
+            # Cálculo del ángulo relativo al robot. Ajusta según sea necesario para tu convención.
+            self.min_obstacle_angle = (min_obstacle_index * (2 * math.pi / 24.0)) - math.pi
+        else:
+            self.min_obstacle_distance = 3.5
+            self.min_obstacle_angle = 0.0
 
     def odom_sub_callback(self, msg):
         self.robot_pose_x = msg.pose.pose.position.x
         self.robot_pose_y = msg.pose.pose.position.y
-        _, _, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
+        #_, _, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
+        self.robot_roll, self.robot_pitch, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
 
         goal_distance = math.sqrt(
             (self.goal_pose_x - self.robot_pose_x) ** 2
@@ -202,36 +228,64 @@ class RLEnvironment(Node):
 
     def calculate_state(self):
         state = []
+        # Asegurarse de que self.scan_ranges tenga 24 elementos (de scan_sub_callback)
+        for scan_val in self.scan_ranges:
+            state.append(float(scan_val))
+
+        # Información del objetivo
         state.append(float(self.goal_distance))
         state.append(float(self.goal_angle))
 
-        for var in self.scan_ranges:
-            state.append(float(var))
+        # Información del obstáculo más cercano
+        state.append(float(self.min_obstacle_distance))
+        state.append(float(self.min_obstacle_angle))
+
+        # DEBUG: Puedes descomentar esto para verificar el tamaño del estado antes de devolverlo
+        # self.get_logger().info(f"calculate_state: len(self.scan_ranges)={len(self.scan_ranges)}, len(state)={len(state)}")
+
         self.local_step += 1
 
+        # --- Condiciones de Fin de Episodio ---
+        # 1. Meta Alcanzada
         if self.goal_distance < 0.20:
-            self.get_logger().info('Goal Reached')
-            self.succeed = True
-            self.done = True
-            self.cmd_vel_pub.publish(Twist())
-            self.local_step = 0
-            self.call_task_succeed()
+            if not self.done: # Solo si no está ya 'done'
+                self.get_logger().info('Goal Reached')
+                self.succeed = True
+                self.done = True
+                self.cmd_vel_pub.publish(Twist())
+                self.local_step = 0
+                self.call_task_succeed()
 
-        if self.min_obstacle_distance < 0.15:
-            self.get_logger().info('Collision happened')
-            self.fail = True
-            self.done = True
-            self.cmd_vel_pub.publish(Twist())
-            self.local_step = 0
-            self.call_task_failed()
+        # 2. Colisión (por LIDAR)
+        # Ajusta este umbral si quieres que sea más sensible
+        if self.min_obstacle_distance < 0.18: # Probando con 0.18 (antes 0.15)
+            if not self.done: # Solo si no está ya 'done'
+                self.get_logger().info(f'Collision (LIDAR) happened! Min_obstacle_distance: {self.min_obstacle_distance:.2f}')
+                self.fail = True
+                self.done = True
+                self.cmd_vel_pub.publish(Twist())
+                self.local_step = 0
+                self.call_task_failed()
 
+        # 3. Vuelco (por Roll/Pitch)
+        if abs(self.robot_roll) > self.max_roll_pitch or abs(self.robot_pitch) > self.max_roll_pitch:
+            if not self.done: # Solo si no está ya 'done'
+                self.get_logger().info(f"Robot TIPPED OVER! Roll: {self.robot_roll:.2f}, Pitch: {self.robot_pitch:.2f}")
+                self.fail = True
+                self.done = True
+                self.cmd_vel_pub.publish(Twist())
+                self.local_step = 0
+                self.call_task_failed()
+
+        # 4. Timeout (Máximo de pasos)
         if self.local_step == self.max_step:
-            self.get_logger().info('Time out!')
-            self.fail = True
-            self.done = True
-            self.cmd_vel_pub.publish(Twist())
-            self.local_step = 0
-            self.call_task_failed()
+            if not self.done: # Solo si no está ya 'done'
+                self.get_logger().info('Time out!')
+                self.fail = True
+                self.done = True
+                self.cmd_vel_pub.publish(Twist())
+                self.local_step = 0
+                self.call_task_failed()
 
         return state
 
